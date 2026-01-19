@@ -36,6 +36,11 @@ config = {
     # 图片复制模式: "copy" | "hardlink" | "symlink"
     "image_mode": "copy",
 
+    # 清洗后点云文件名（位于 colmap_dir 内）
+    "clean_points_filename": "points3D_clean.txt",
+    # 原始点云文件名（位于 colmap_dir 内）
+    "points_filename": "Points3D.txt",
+
     # 如果输出已存在，是否覆盖
     "overwrite": True,
     # 仅打印不写出
@@ -246,7 +251,10 @@ def main():
 
     cameras_path = colmap_dir / "Cameras.txt"
     images_path = colmap_dir / "Images.txt"
-    points_path = colmap_dir / "Points3D.txt"
+    points_path = colmap_dir / config["points_filename"]
+    clean_points_path = colmap_dir / config["clean_points_filename"]
+    if clean_points_path.exists():
+        points_path = clean_points_path
 
     if not cameras_path.exists():
         raise FileNotFoundError(f"找不到 Cameras.txt: {cameras_path}")

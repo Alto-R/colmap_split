@@ -5,7 +5,7 @@ import json
 def _default_path(*parts):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts)
 
-# ================= 配置区域 (Config) =================
+# ================= 配置区域 =================
 config = {
     # COLMAP 文件夹路径 (文件夹内应包含 Points3D.txt / Images.txt)
     "input_path": _default_path("old_street_colmap"),
@@ -19,36 +19,37 @@ config = {
     # 3 = 切成 8 块
     "depth": 4, 
 
-    # 重叠率 (Overlap Ratio)
-    # 0.15 代表每个块向外扩展 15% 的长度作为缓冲区
-    "overlap": 0.15,
+    # 重叠率
+    # 0.08 代表每个块向外扩展 8% 的长度作为缓冲区
+    "overlap": 0.08,
 
     # 最小观测点数阈值
     # 如果一张照片观测到的点中，有超过 50 个点属于当前分块，则认为这张照片属于该分块
     "min_points_obs": 50,
 
     # 预处理：拆分前清洗点云（可选）
-    # method: "statistical" | "abs_clip" | "bbox"
+    # 方法: "statistical" | "abs_clip" | "bbox"
     "preprocess": {
         "enabled": True,
-        "method": "statistical",
-        "statistical": {
-            "nb_neighbors": 20,
-            "std_ratio": 2.0
-        },
-        # abs_clip: 直接按坐标阈值截断 (例如 10000 或 1e6)
+
+        # 1) 坐标绝对值裁剪
         "abs_clip": {
-            "abs_max": None
+            "abs_max": 5000.0
         },
-        # bbox: 直接使用固定 AABB 过滤
-        "bbox": {
-            "min": None,
-            "max": None
+
+        # 2) 轨迹长度过滤
+        "min_track_len": 3,
+
+        # 3) 统计离群点移除
+        "statistical": {
+            "nb_neighbors": 50,
+            "std_ratio": 1.5
         },
-        # 导出清洗后的 points3D（可选）
+
+        # 导出清洗后的点云
         "export_clean_points": {
-            "enabled": False,
-            "output_path": _default_path("old_street_colmap", "Points3D_clean.txt")
+            "enabled": True,
+            "output_path": _default_path("old_street_colmap", "points3D_clean.txt")
         }
     }
 }
@@ -89,6 +90,7 @@ class ColmapSplitter:
         raw_lines = []
         raw_point_ids = []
         raw_points = []
+        raw_track_lengths = []
 
         with open(self.points_file, "r") as f:
             for line in f:
@@ -96,19 +98,33 @@ class ColmapSplitter:
                     header_lines.append(line)
                     continue
                 parts = line.split()
-                if len(parts) < 4: continue
+                if len(parts) < 8: continue
                 pid = int(parts[0])
                 xyz = [float(parts[1]), float(parts[2]), float(parts[3])]
+
+                track_len = (len(parts) - 8) // 2
+
+
+
                 
                 raw_lines.append(line)
                 raw_points.append(xyz)
                 raw_point_ids.append(pid)
+
+                raw_track_lengths.append(track_len)
+
         
         raw_points = np.array(raw_points)
+
+        raw_track_lengths = np.array(raw_track_lengths)
+
         print(f"    原始点数: {len(raw_points)}")
 
+        print(f"    [Before] BBox:\\n      Min: {np.min(raw_points, axis=0)}\\n      Max: {np.max(raw_points, axis=0)}")
+
+
         # 预处理清洗（可选）
-        points, keep_mask = self._preprocess_points(raw_points)
+        points, keep_mask = self._preprocess_points(raw_points, raw_track_lengths)
         if keep_mask is None:
             keep_mask = np.ones(len(raw_points), dtype=bool)
             points = raw_points
@@ -117,6 +133,11 @@ class ColmapSplitter:
         self.point_ids = [pid for pid, keep in zip(raw_point_ids, keep_mask) if keep]
         self.point_id_to_idx = {pid: i for i, pid in enumerate(self.point_ids)}
         print(f"    清洗后点数: {len(self.points)}")
+
+        if len(self.points) > 0:
+
+            print(f"    [After]  BBox:\\n      Min: {np.min(self.points, axis=0)}\\n      Max: {np.max(self.points, axis=0)}")
+
 
         # 可选导出清洗后的 points3D.txt
         preprocess_cfg = config.get("preprocess", {})
@@ -154,7 +175,7 @@ class ColmapSplitter:
                     is_header = False
                 else:
                     parts = line.split()
-                    # 每3个数据为一组: X, Y, POINT3D_ID
+                    # 每 3 个数据为一组: X, Y, POINT3D_ID
                     for i in range(2, len(parts), 3):
                         pid = int(parts[i])
                         if pid != -1 and pid in self.point_id_to_idx:
@@ -164,56 +185,61 @@ class ColmapSplitter:
                     is_header = True 
         print(f"    已加载 {len(self.images)} 张图片信息。")
 
-    def _preprocess_points(self, points_np):
+    def _preprocess_points(self, points_np, track_lengths=None):
+        """
+        预处理流水线：坐标裁剪 -> 轨迹长度 -> 统计离群点
+        """
         preprocess_cfg = config.get("preprocess", {})
         if not preprocess_cfg.get("enabled", False):
-            return points_np, None
+            return points_np, np.ones(len(points_np), dtype=bool)
 
-        method = preprocess_cfg.get("method", "statistical")
-        if method == "statistical":
+        final_mask = np.ones(len(points_np), dtype=bool)
+
+        # 1) 坐标绝对值裁剪
+        if "abs_clip" in preprocess_cfg:
+            abs_cfg = preprocess_cfg["abs_clip"]
+            abs_max = abs_cfg.get("abs_max", None)
+            if abs_max is not None:
+                print(f"    [Preprocess] Absolute clip: max={abs_max}")
+                mask_clip = np.all(np.abs(points_np) < float(abs_max), axis=1)
+                final_mask &= mask_clip
+
+        # 2) 轨迹长度过滤
+        if "min_track_len" in preprocess_cfg and track_lengths is not None:
+            min_len = int(preprocess_cfg["min_track_len"])
+            print(f"    [Preprocess] Track length: min_track={min_len}")
+            mask_track = track_lengths >= min_len
+            final_mask &= mask_track
+
+        # 3) 统计离群点移除
+        if "statistical" in preprocess_cfg:
+            st_cfg = preprocess_cfg["statistical"]
+            nb = int(st_cfg.get("nb_neighbors", 20))
+            std = float(st_cfg.get("std_ratio", 2.0))
+            print(f"    [Preprocess] Statistical: nb={nb}, std={std}")
             try:
                 import open3d as o3d
+
+                current_valid_indices = np.where(final_mask)[0]
+                if len(current_valid_indices) > 0:
+                    valid_points = points_np[current_valid_indices]
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(valid_points)
+
+                    _, inlier_indices_local = pcd.remove_statistical_outlier(
+                        nb_neighbors=nb, std_ratio=std
+                    )
+
+                    new_mask_local = np.zeros(len(valid_points), dtype=bool)
+                    new_mask_local[inlier_indices_local] = True
+                    final_mask[current_valid_indices] = new_mask_local
+            except ImportError:
+                print("    [Warning] Open3D not found, skipping statistical")
             except Exception as e:
-                raise ImportError(
-                    "未检测到 open3d。请先安装 open3d，或将 preprocess.method 改为 'abs_clip' / 'bbox'."
-                ) from e
+                print(f"    [Warning] Statistical failed: {e}")
 
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points_np)
-            st_cfg = preprocess_cfg.get("statistical", {})
-            nb_neighbors = int(st_cfg.get("nb_neighbors", 20))
-            std_ratio = float(st_cfg.get("std_ratio", 2.0))
-            _, ind = pcd.remove_statistical_outlier(
-                nb_neighbors=nb_neighbors, std_ratio=std_ratio
-            )
-            mask = np.zeros(len(points_np), dtype=bool)
-            mask[np.array(ind, dtype=np.int64)] = True
-            return points_np[mask], mask
-
-        if method == "abs_clip":
-            abs_cfg = preprocess_cfg.get("abs_clip", {})
-            abs_max = abs_cfg.get("abs_max", None)
-            if abs_max is None:
-                raise ValueError("preprocess.abs_clip.abs_max 未设置")
-            abs_max = float(abs_max)
-            mask = np.all(np.abs(points_np) < abs_max, axis=1)
-            return points_np[mask], mask
-
-        if method == "bbox":
-            bbox_cfg = preprocess_cfg.get("bbox", {})
-            min_v = bbox_cfg.get("min", None)
-            max_v = bbox_cfg.get("max", None)
-            if min_v is None or max_v is None:
-                raise ValueError("preprocess.bbox.min / preprocess.bbox.max 未设置")
-            min_v = np.array(min_v, dtype=float)
-            max_v = np.array(max_v, dtype=float)
-            if min_v.shape != (3,) or max_v.shape != (3,):
-                raise ValueError("preprocess.bbox.min / max 必须是长度为 3 的数组")
-            mask = np.all(points_np >= min_v, axis=1) & np.all(points_np <= max_v, axis=1)
-            return points_np[mask], mask
-
-        raise ValueError(f"未知 preprocess.method: {method}")
-
+        return points_np[final_mask], final_mask    
+    
     def kdtree_split(self, point_indices, depth, current_depth=0):
         """KD-Tree 递归切分核心逻辑"""
         # 递归终止条件
@@ -227,7 +253,7 @@ class ColmapSplitter:
         span = max_xyz - min_xyz
         split_axis = np.argmax(span) 
 
-        # 2. 寻找中位数 (Median) 以保证点云数量均衡
+        # 2. 寻找中位数以保证点云数量均衡
         axis_values = current_points[:, split_axis]
         median_val = np.median(axis_values)
 
@@ -235,7 +261,7 @@ class ColmapSplitter:
         left_indices = []
         right_indices = []
         
-        # 优化：使用 numpy mask 可能会更快，但为了保持索引对应关系，这里使用循环更稳妥
+        # 优化：使用 numpy 的 mask 可能更快，但为保持索引对应关系，这里用循环更稳妥
         # 若数据量极大(千万级)，此处可进一步优化
         for idx in point_indices:
             val = self.points[idx][split_axis]
@@ -258,15 +284,23 @@ class ColmapSplitter:
             # --- 核心几何计算 ---
             pts = self.points[indices]
             
-            # 1. Strict BBox (严格包围盒): 用于最后合并时的裁剪 (Crop)
+            # 1. 严格包围盒：用于最后合并时的裁剪
             min_strict = np.min(pts, axis=0)
             max_strict = np.max(pts, axis=0)
             
-            # 2. Overlap BBox (带重叠包围盒): 用于训练时的加载
+            # 2. 重叠包围盒：用于训练时的加载
             dimensions = max_strict - min_strict
             margin = dimensions * overlap_ratio
             min_overlap = min_strict - margin
             max_overlap = max_strict + margin
+
+            # 3. 重叠区点数量（包围盒内的点数）
+            # 注意：这是全局点云中落在重叠包围盒内的点数
+            overlap_mask = np.all(
+                (self.points >= min_overlap) & (self.points <= max_overlap),
+                axis=1,
+            )
+            overlap_n_points = int(np.sum(overlap_mask))
             
             # --- 图片筛选逻辑 ---
             # 优化：使用 set 提高查找速度
@@ -286,8 +320,9 @@ class ColmapSplitter:
             part_data = {
                 "name": part_name,
                 "n_points": len(indices),
+                "overlap_n_points": overlap_n_points,
                 "n_images": len(relevant_images),
-                # 重点：这两个 box 是后续流程的关键
+                # 重点：这两个包围盒是后续流程的关键
                 "strict_min": min_strict.tolist(),
                 "strict_max": max_strict.tolist(),
                 "overlap_min": min_overlap.tolist(),
