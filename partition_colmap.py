@@ -25,7 +25,32 @@ config = {
 
     # 最小观测点数阈值
     # 如果一张照片观测到的点中，有超过 50 个点属于当前分块，则认为这张照片属于该分块
-    "min_points_obs": 50
+    "min_points_obs": 50,
+
+    # 预处理：拆分前清洗点云（可选）
+    # method: "statistical" | "abs_clip" | "bbox"
+    "preprocess": {
+        "enabled": True,
+        "method": "statistical",
+        "statistical": {
+            "nb_neighbors": 20,
+            "std_ratio": 2.0
+        },
+        # abs_clip: 直接按坐标阈值截断 (例如 10000 或 1e6)
+        "abs_clip": {
+            "abs_max": None
+        },
+        # bbox: 直接使用固定 AABB 过滤
+        "bbox": {
+            "min": None,
+            "max": None
+        },
+        # 导出清洗后的 points3D（可选）
+        "export_clean_points": {
+            "enabled": False,
+            "output_path": _default_path("old_street_colmap", "Points3D_clean.txt")
+        }
+    }
 }
 # ====================================================
 
@@ -60,20 +85,54 @@ class ColmapSplitter:
         if not os.path.exists(self.points_file):
             raise FileNotFoundError(f"找不到文件: {self.points_file}")
 
+        header_lines = []
+        raw_lines = []
+        raw_point_ids = []
+        raw_points = []
+
         with open(self.points_file, "r") as f:
             for line in f:
-                if line.startswith("#"): continue
+                if line.startswith("#"):
+                    header_lines.append(line)
+                    continue
                 parts = line.split()
                 if len(parts) < 4: continue
                 pid = int(parts[0])
                 xyz = [float(parts[1]), float(parts[2]), float(parts[3])]
                 
-                self.point_id_to_idx[pid] = len(self.points)
-                self.points.append(xyz)
-                self.point_ids.append(pid)
+                raw_lines.append(line)
+                raw_points.append(xyz)
+                raw_point_ids.append(pid)
         
-        self.points = np.array(self.points)
-        print(f"    已加载 {len(self.points)} 个 3D 点。")
+        raw_points = np.array(raw_points)
+        print(f"    原始点数: {len(raw_points)}")
+
+        # 预处理清洗（可选）
+        points, keep_mask = self._preprocess_points(raw_points)
+        if keep_mask is None:
+            keep_mask = np.ones(len(raw_points), dtype=bool)
+            points = raw_points
+
+        self.points = points
+        self.point_ids = [pid for pid, keep in zip(raw_point_ids, keep_mask) if keep]
+        self.point_id_to_idx = {pid: i for i, pid in enumerate(self.point_ids)}
+        print(f"    清洗后点数: {len(self.points)}")
+
+        # 可选导出清洗后的 points3D.txt
+        preprocess_cfg = config.get("preprocess", {})
+        export_cfg = preprocess_cfg.get("export_clean_points", {})
+        if export_cfg.get("enabled", False):
+            out_path = export_cfg.get("output_path")
+            if not out_path:
+                raise ValueError("preprocess.export_clean_points.output_path 未设置")
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as f:
+                for line in header_lines:
+                    f.write(line)
+                for line, keep in zip(raw_lines, keep_mask):
+                    if keep:
+                        f.write(line)
+            print(f"    已导出清洗后的点云: {out_path}")
 
         print(f"[-] 正在读取相机视图: {self.images_file}")
         if not os.path.exists(self.images_file):
@@ -104,6 +163,56 @@ class ColmapSplitter:
                     self.images.append(current_image)
                     is_header = True 
         print(f"    已加载 {len(self.images)} 张图片信息。")
+
+    def _preprocess_points(self, points_np):
+        preprocess_cfg = config.get("preprocess", {})
+        if not preprocess_cfg.get("enabled", False):
+            return points_np, None
+
+        method = preprocess_cfg.get("method", "statistical")
+        if method == "statistical":
+            try:
+                import open3d as o3d
+            except Exception as e:
+                raise ImportError(
+                    "未检测到 open3d。请先安装 open3d，或将 preprocess.method 改为 'abs_clip' / 'bbox'."
+                ) from e
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points_np)
+            st_cfg = preprocess_cfg.get("statistical", {})
+            nb_neighbors = int(st_cfg.get("nb_neighbors", 20))
+            std_ratio = float(st_cfg.get("std_ratio", 2.0))
+            _, ind = pcd.remove_statistical_outlier(
+                nb_neighbors=nb_neighbors, std_ratio=std_ratio
+            )
+            mask = np.zeros(len(points_np), dtype=bool)
+            mask[np.array(ind, dtype=np.int64)] = True
+            return points_np[mask], mask
+
+        if method == "abs_clip":
+            abs_cfg = preprocess_cfg.get("abs_clip", {})
+            abs_max = abs_cfg.get("abs_max", None)
+            if abs_max is None:
+                raise ValueError("preprocess.abs_clip.abs_max 未设置")
+            abs_max = float(abs_max)
+            mask = np.all(np.abs(points_np) < abs_max, axis=1)
+            return points_np[mask], mask
+
+        if method == "bbox":
+            bbox_cfg = preprocess_cfg.get("bbox", {})
+            min_v = bbox_cfg.get("min", None)
+            max_v = bbox_cfg.get("max", None)
+            if min_v is None or max_v is None:
+                raise ValueError("preprocess.bbox.min / preprocess.bbox.max 未设置")
+            min_v = np.array(min_v, dtype=float)
+            max_v = np.array(max_v, dtype=float)
+            if min_v.shape != (3,) or max_v.shape != (3,):
+                raise ValueError("preprocess.bbox.min / max 必须是长度为 3 的数组")
+            mask = np.all(points_np >= min_v, axis=1) & np.all(points_np <= max_v, axis=1)
+            return points_np[mask], mask
+
+        raise ValueError(f"未知 preprocess.method: {method}")
 
     def kdtree_split(self, point_indices, depth, current_depth=0):
         """KD-Tree 递归切分核心逻辑"""
