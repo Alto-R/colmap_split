@@ -17,7 +17,7 @@ config = {
     # 1 = 切成 2 块
     # 2 = 切成 4 块
     # 3 = 切成 8 块
-    "depth": 3, 
+    "depth": 4, 
 
     # 重叠率 (Overlap Ratio)
     # 0.15 代表每个块向外扩展 15% 的长度作为缓冲区
@@ -217,7 +217,7 @@ class ColmapSplitter:
     def kdtree_split(self, point_indices, depth, current_depth=0):
         """KD-Tree 递归切分核心逻辑"""
         # 递归终止条件
-        if current_depth >= depth or len(point_indices) < 100:
+        if current_depth >= depth or len(point_indices) < 50:
             return [point_indices]
 
         # 1. 寻找跨度最大的轴 (X, Y, Z)
