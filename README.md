@@ -10,6 +10,7 @@ colmap_split/
     Cameras.txt
     Images.txt
     Points3D.txt
+    points3D_clean.txt  (可选，清洗后点云)
     images/
   split_output/
   split_colmap/
@@ -24,6 +25,7 @@ colmap_split/
 
 2) 生成分块 COLMAP  
 运行 `build_partitioned_colmap.py`，为每个分块生成独立的 `sparse/0` 与 `images` 目录。
+如果 `points3D_clean.txt` 存在，则默认使用清洗后点云；否则使用原始 `Points3D.txt`。
 
 ## 1. 分块脚本：partition_colmap.py
 
@@ -42,7 +44,11 @@ depth         # KD-Tree 深度（2^depth 个分块）
 overlap       # 重叠比例（bbox 外扩）
 min_points_obs# 图片归属阈值（分块内观测点数）
 
-preprocess.enabled / method  # 可选点云清洗
+preprocess.enabled           # 可选点云清洗开关
+preprocess.abs_clip          # 坐标绝对值裁剪
+preprocess.min_track_len     # 轨迹长度过滤
+preprocess.statistical       # 统计离群点移除
+preprocess.export_clean_points # 导出清洗后点云
 ```
 
 产物示例（JSON）：
@@ -67,6 +73,8 @@ output_root   # 输出根目录
 min_track_len # 点在该分块内的最小观测次数
 point_filter  # "overlap" | "strict" | "none"
 image_mode    # "copy" | "hardlink" | "symlink"
+clean_points_filename  # 清洗后点云文件名（默认 points3D_clean.txt）
+points_filename        # 原始点云文件名（默认 Points3D.txt）
 overwrite     # 是否覆盖已有输出（会删除已有分块目录）
 ```
 
@@ -100,3 +108,4 @@ split_colmap/
 
 - 修改 `overlap` 后请先重新运行 `partition_colmap.py` 生成新的 JSON。
 - `depth` 越大分块越多，但受最小叶子点数限制，实际块数可能少于 `2^depth`。
+- 如需保证分块 bbox 与实际点筛选完全一致，请确保 `points3D_clean.txt` 存在；脚本会优先使用清洗后点云。
