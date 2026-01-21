@@ -91,6 +91,27 @@ split_colmap/
       *.jpg
 ```
 
+## 3. 合并分块训练结果：merge_partitioned_gaussians.py
+
+用途：将每个分块训练得到的高斯点云（PLY）合并为一个整体。  
+默认会使用 `strict_min/max` 作为“清晰区域”，以避免 overlap 区域重复和拼接不自然。
+
+关键配置（文件顶部 `config`）：
+
+```
+parts_dir        # partition_colmap.py 输出的 split_output 目录
+gaussian_root    # 分块训练结果根目录（含 part_0, part_1, ...）
+gaussian_relpath # 每个 part 内 PLY 相对路径（支持 glob，如 output/*.ply）
+output_ply       # 合并后的输出 PLY
+mode             # "strict" | "overlap"
+keep_orphans     # strict 模式下，保留不在任何 strict bbox 内但落在 overlap 的点
+chunk_size       # 分块读取大小
+```
+
+建议：
+- `mode="strict"`：只保留每个分块最清晰的区域，拼接更自然。
+- 若发现边缘有缺口，可开启 `keep_orphans=True`。
+
 ## 点过滤逻辑说明（build_partitioned_colmap.py）
 
 - `point_filter="overlap"`（推荐并行训练）
